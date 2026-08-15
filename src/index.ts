@@ -18,16 +18,22 @@ interface QueuedPublish {
 }
 
 // The Durable Object serializes RPCs, so per-event round trips cap throughput.
-// Coalesce publishes here: while a batch window is open, every request awaits the
-// SAME promise, keeping the isolate alive so the 5ms window actually elapses and
-// concurrent events are delivered in a single DO RPC.
+// Coalesce publishes here: while a batch window is open, every request hands the
+// SAME promise to ctx.waitUntil, so the isolate stays alive for the 5ms window
+// to elapse and concurrent events are delivered in a single DO RPC — while the
+// client ack returns immediately (no waiting on the DO round trip).
 // IMPORTANT: DO stubs are request-bound I/O (an OutgoingFactory), so they must be
-// created inside each request and passed into the shared drain — the request that
-// started the drain stays in-flight until it resolves, so its stub remains valid.
+// created inside each request and passed into the shared drain — waitUntil keeps
+// that request's context alive until the drain completes, so the stub stays valid.
 const publishQueue: QueuedPublish[] = [];
 let activeBatch: Promise<void> | null = null;
 
 const BATCH_WINDOW_MS = 5;
+
+interface HubRpcStub {
+  processBatch(events: unknown[]): Promise<{ processed: number; total: number }> | { processed: number; total: number };
+  metricsSnapshot(): Promise<Record<string, unknown>> | Record<string, unknown>;
+}
 
 async function drainNow(stub: DurableObjectStub): Promise<void> {
   // Window: concurrent requests push during this await, then we send them as one batch.
@@ -35,30 +41,24 @@ async function drainNow(stub: DurableObjectStub): Promise<void> {
   while (publishQueue.length > 0) {
     const batch = publishQueue.splice(0, BATCH_MAX);
     try {
-      await stub.fetch(
-        new Request('https://hub.local/publish/batch', {
-          method: 'POST',
-          body: JSON.stringify({ events: batch }),
-          headers: { 'content-type': 'application/json' },
-        }),
-      );
+      await (stub as unknown as HubRpcStub).processBatch(batch);
     } catch {
       // Best-effort: drop this batch rather than blocking the caller.
     }
   }
 }
 
-function flushPublishes(stub: DurableObjectStub): Promise<void> {
+function flushPublishes(stub: DurableObjectStub, ctx: ExecutionContext): void {
   if (!activeBatch) {
     activeBatch = drainNow(stub).finally(() => {
       activeBatch = null;
     });
   }
-  return activeBatch;
+  ctx.waitUntil(activeBatch);
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/api/health') {
@@ -73,7 +73,8 @@ export default {
     const stub = env.REALTIME_HUB.get(env.REALTIME_HUB.idFromName(HUB_NAME));
 
     if (url.pathname === '/api/metrics') {
-      return stub.fetch(new Request('https://hub.local/metrics', { method: 'GET' }));
+      const data = await (stub as unknown as HubRpcStub).metricsSnapshot();
+      return Response.json(data);
     }
 
     if (url.pathname === '/api/publish' && request.method === 'POST') {
@@ -101,7 +102,7 @@ export default {
         return Response.json({ error: 'Provide userId, channel, or broadcast' }, { status: 400 });
       }
       publishQueue.push({ userId: parsed.userId, channel: parsed.channel, broadcast: parsed.broadcast, event: parsed.event });
-      await flushPublishes(stub);
+      flushPublishes(stub, ctx);
       return Response.json({ ok: true, queued: publishQueue.length });
     }
 

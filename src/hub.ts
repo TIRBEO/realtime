@@ -485,11 +485,26 @@ export class RealtimeHub extends DurableObject<Env> {
     if (!Array.isArray(body?.events)) {
       return Response.json({ error: 'events[] is required' }, { status: 400 });
     }
+    const res = this.processBatch(body.events);
+    return Response.json({ ok: true, ...res });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Direct RPC targets (invoked via stub.method() — faster than HTTP fetch RPC)
+  // ---------------------------------------------------------------------------
+
+  /** Batch RPC: accepts `{ events: PublishBody[] }` and delivers each in one call. */
+  processBatch(events: unknown[]): { processed: number; total: number } {
+    if (!Array.isArray(events)) return { processed: 0, total: 0 };
     let processed = 0;
-    for (const entry of body.events) {
+    for (const entry of events) {
       if (this.processPublishBody(entry as { userId?: string; channel?: string; broadcast?: boolean; event: Record<string, unknown> } | undefined)) processed += 1;
     }
-    return Response.json({ ok: true, processed, total: body.events.length });
+    return { processed, total: events.length };
+  }
+
+  metricsSnapshot() {
+    return this.snapshot();
   }
 
   // ---------------------------------------------------------------------------
