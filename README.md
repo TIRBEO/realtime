@@ -1,9 +1,9 @@
 # Tirbeo Realtime Platform (`ws.tirbeo.app`)
 
-Centralized, horizontally-scalable WebSocket infrastructure for the Tirbeo
-ecosystem. Runs as a standalone Next.js (App Router) app on Vercel Fluid Compute.
-The api (and any other service) pushes events into it; every client app subscribes
-to channels.
+Centralized WebSocket infrastructure for the Tirbeo ecosystem. Runs as a
+**Cloudflare Worker with a single global Durable Object** that owns every
+connection. The api (and any other service) pushes events into it via HTTP;
+every client app subscribes to channels over one WebSocket.
 
 ## Architecture
 
@@ -11,66 +11,81 @@ to channels.
   client apps (dashboard, admin, support, forms, flows)
         │  WebSocket  wss://ws.tirbeo.app/ws
         ▼
-   ┌─────────────────────────────┐   Redis pub/sub (tirbeo:rt:events)   ┌──────────────┐
-   │  realtime hub (this app)    │ ───────────────────────────────────► │ other Vercel │
-   │  - JWT auth (shared secret) │ ◄─────────────────────────────────── │ instances     │
-   │  - channel subscriptions    │                                     └──────────────┘
-   │  - presence, rate limits    │
-   │  - heartbeat, metrics       │
-   └─────────────────────────────┘
+   ┌────────────────────────────────────────────┐
+   │ Worker (edge)                              │
+   │  /ws            → forwards upgrade to hub  │
+   │  /api/publish   → Bearer API_TOKEN → hub   │
+   │  /api/health, /api/metrics                 │
+   └──────────────┬─────────────────────────────┘
+                  │ Durable Object stub (idFromName("hub"))
+                  ▼
+   ┌────────────────────────────────────────────┐
+   │ RealtimeHub (single global Durable Object) │
+   │  - WebSocket Hibernation API connections   │
+   │  - JWT auth (jose, shared JWT_SECRET)      │
+   │  - channel subscriptions, presence         │
+   │  - fan-out (no Redis needed — one hub)     │
+   │  - heartbeat via storage alarm             │
+   └────────────────────────────────────────────┘
         ▲
-        │  HTTP POST /api/publish (Bearer API_TOKEN) or Redis pub/sub
+        │  HTTP POST /api/publish (Bearer API_TOKEN)
    api.tirbeo.app
 ```
 
-- **Auth**: clients send `{ type: 'auth', token }` with their short-lived session
-  access token (15m). The token is verified with `jose` HS256 using the **same
-  `JWT_SECRET`** as api.tirbeo.app, then the session is checked against the
-  `sessions`/`users` tables (cached in Redis for 60s). If `DATABASE_URL` is
-  unset, only signature verification runs.
+- **Auth**: clients send `{ type: 'auth', token }` with their short-lived
+  session access token (15m). Verified with `jose` HS256 using the **same
+  `JWT_SECRET`** as api.tirbeo.app. If `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY`
+  are set, the session + user status are checked via PostgREST (cached 60s in
+  the Durable Object). Otherwise auth is signature-only and the `adminRole`
+  JWT claim is used for channel authorization.
 - **Channels**: `public:*`, `user:{id}`, `org:{id}`, `workspace:{id}`,
   `flow:{id}`, `ticket:{id}`, `document:{id}`, `deployment:{id}`, `call:{id}`,
   `chat:{id}`, and bare app channels (`admin`, `support`, `flows`, `dashboard`).
-- **Cross-instance**: each Vercel instance publishes envelopes to the Redis
-  `events` channel; a subscriber delivers to local connections. Local delivery
-  is synchronous for latency; remote instances skip envelopes they produced.
+- **Cross-instance**: a single global Durable Object instance makes fan-out
+  trivial and needs no Redis pub/sub. Scaling later = shard the hub by channel
+  hash (the wire protocol does not change).
 - **Publishing**: the api calls HTTP `POST https://ws.tirbeo.app/api/publish`
-  with `Authorization: Bearer $API_TOKEN` (or publishes to the Redis channel).
+  with `Authorization: Bearer $API_TOKEN`.
 
-## Deploy on Vercel (ws.tirbeo.app)
+## Deploy on Cloudflare (`ws.tirbeo.app`)
 
-1. Create a new project in Vercel from this repo (root = `apps/realtime`,
-   framework = Next.js).
-2. Enable **Fluid Compute** (Settings → Functions) — required for WebSockets.
-3. Environment variables (must match the api):
-   - `JWT_SECRET` — same as api.tirbeo.app
-   - `DATABASE_URL` — session-mode pooler (port 5432)
-   - `REDIS_URL` — Upstash Redis (same instance the api uses)
-   - `API_TOKEN` — shared secret the api uses to publish
-   - `RT_NAMESPACE` — optional, default `tirbeo:rt`
-4. Add custom domain **ws.tirbeo.app**.
-5. Deploy. Verify: `curl https://ws.tirbeo.app/api/health`.
+```bash
+cd apps/realtime
+pnpm install
+npx wrangler login
+npx wrangler secret put JWT_SECRET     # same as api.tirbeo.app
+npx wrangler secret put API_TOKEN      # shared with the api's RT_API_TOKEN
+# optional — enables live session/role checks:
+# npx wrangler secret put SUPABASE_URL
+# npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+npx wrangler deploy
+```
+
+Then in the Cloudflare dashboard: **Workers → tirbeo-realtime → Settings →
+Domains & Routes → Add custom domain → `ws.tirbeo.app`**.
+
+Verify: `curl https://ws.tirbeo.app/api/health` → `{"status":"ok",...}`.
+
+> Note: the realtime project on Vercel is superseded by this Worker — delete it
+> so pushes to this repo don't trigger failing Vercel builds.
 
 ## Local development
 
-WebSocket upgrades only work under `vercel dev` (not `next dev`):
-
 ```bash
-pnpm install
-vercel env pull
-pnpm dev        # → http://localhost:4001 (ws://localhost:4001/ws)
+cp .env.example .dev.vars   # fill in real values (or copy from api/.env.local)
+npx wrangler dev            # → http://localhost:8787 (ws://localhost:8787/ws)
 ```
+
+The protocol is backward-compatible with the api's local dev WebSocket server
+(`apps/api` port 3001), so the same client code works locally and in production.
 
 ## Protocol
 
-See `lib/protocol.ts`. Client → server: `auth`, `subscribe`, `unsubscribe`,
+See `src/protocol.ts`. Client → server: `auth`, `subscribe`, `unsubscribe`,
 `publish`, `ping`, `pong`, `get_hints`, `get_maintenance`.
 Server → client: `auth_ok`, `auth_error`, `subscribed`, `unsubscribed`,
 `event`, `presence`, `ping`, `pong`, `error`, `rate_limit_exceeded`,
 `maintenance_status`, `server_hints`.
-
-The protocol is backward-compatible with the api's local dev WebSocket server
-(`apps/api` port 3001), so the same client code works locally and in production.
 
 ## HTTP publish example
 

@@ -1,0 +1,19 @@
+name = "tirbeo-realtime"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+# Ws.tirbeo.app is mapped as a custom domain; a workers.dev route is also
+# provisioned automatically for quick testing.
+# workers_dev = false
+
+# Single global hub instance (idFromName("hub")) — all connections live here.
+[[durable_objects.bindings]]
+name = "REALTIME_HUB"
+class_name = "RealtimeHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RealtimeHub"]
+
+[vars]
+RT_NAMESPACE = "tirbeo:rt"
