@@ -9,11 +9,17 @@ compatibility_date = "2025-12-01"
 # Single global hub instance (idFromName("hub")) — all connections live here.
 [[durable_objects.bindings]]
 name = "REALTIME_HUB"
-class_name = "RealtimeHub"
+class_name = "RealtimeHubV2"
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RealtimeHub"]
+
+# v2: new class + namespace so fresh instances run the batched publish code
+# (existing instances keep running the deployed code they were created under).
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RealtimeHubV2"]
 
 [vars]
 RT_NAMESPACE = "tirbeo:rt"

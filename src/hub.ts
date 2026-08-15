@@ -15,7 +15,7 @@ import type { Env } from './env';
 const CONFIG = {
   authTimeoutMs: 5_000,
   heartbeatIntervalMs: 30_000,
-  maxConnsPerIp: 8,
+  maxConnsPerIp: 32,
   msgWindowMs: 10_000,
   msgWindowLimit: 250,
   publishWindowLimit: 40,
@@ -41,7 +41,7 @@ interface SocketState {
 const now = () => Date.now();
 
 /**
- * RealtimeHub — a single global Durable Object that owns every connection.
+ * RealtimeHubV2 — a single global Durable Object that owns every connection.
  *
  * Using one instance (idFromName("hub")) preserves the single-connection,
  * multi-channel protocol and gives presence + fan-out without Redis. WebSocket
@@ -70,6 +70,9 @@ export class RealtimeHub extends DurableObject<Env> {
       return this.handleUpgrade(request);
     }
 
+    if (request.method === 'POST' && url.pathname.endsWith('/publish/batch')) {
+      return this.handlePublishBatch(request);
+    }
     if (request.method === 'POST' && url.pathname.endsWith('/publish')) {
       return this.handlePublish(request);
     }
@@ -431,16 +434,29 @@ export class RealtimeHub extends DurableObject<Env> {
       return Response.json({ error: 'Invalid JSON' }, { status: 400 });
     }
 
-    if (!body?.event || typeof body.event.type !== 'string' || !body.event.type) {
-      return Response.json({ error: 'event.type is required' }, { status: 400 });
+    const id = this.processPublishBody(body);
+    if (!id) {
+      return Response.json({ error: 'Provide userId, channel, or broadcast' }, { status: 400 });
     }
+    return Response.json({ ok: true, eventId: id });
+  }
 
-    const base = body.event;
+  /** Publish a single event; returns its id, or null when the target is missing. */
+  private processPublishBody(
+    body:
+      | { userId?: string; channel?: string; broadcast?: boolean; event: Record<string, unknown> }
+      | undefined,
+  ): string | null {
+    if (!body?.event || typeof body.event.type !== 'string' || !body.event.type) return null;
+
+    const base = body.event as Partial<RealtimeEvent>;
     const event: RealtimeEvent = {
       ...base,
       id: crypto.randomUUID(),
-      channel: base.channel || body.channel || '',
-      timestamp: base.timestamp || new Date().toISOString(),
+      channel: String(base.channel || body.channel || ''),
+      timestamp: String(base.timestamp || new Date().toISOString()),
+      type: String(base.type),
+      payload: base.payload ?? {},
     };
 
     if (body.userId) {
@@ -451,11 +467,29 @@ export class RealtimeHub extends DurableObject<Env> {
       event.channel = body.channel;
       this.deliver(event.channel, event);
     } else {
-      return Response.json({ error: 'Provide userId, channel, or broadcast' }, { status: 400 });
+      return null;
     }
 
     this.eventsPublished += 1;
-    return Response.json({ ok: true, eventId: event.id });
+    return event.id;
+  }
+
+  /** Batch RPC: accepts `{ events: PublishBody[] }` and delivers each in one call. */
+  private async handlePublishBatch(request: Request): Promise<Response> {
+    let body: { events?: unknown[] };
+    try {
+      body = (await request.json()) as { events?: unknown[] };
+    } catch {
+      return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+    }
+    if (!Array.isArray(body?.events)) {
+      return Response.json({ error: 'events[] is required' }, { status: 400 });
+    }
+    let processed = 0;
+    for (const entry of body.events) {
+      if (this.processPublishBody(entry as { userId?: string; channel?: string; broadcast?: boolean; event: Record<string, unknown> } | undefined)) processed += 1;
+    }
+    return Response.json({ ok: true, processed, total: body.events.length });
   }
 
   // ---------------------------------------------------------------------------
